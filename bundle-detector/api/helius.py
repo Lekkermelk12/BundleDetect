@@ -87,6 +87,25 @@ class HeliusClient:
             return []
         return [item["signature"] for item in result if isinstance(item, dict) and "signature" in item]
 
+    def get_token_balance(self, wallet: str, mint: str) -> float:
+        """Get a specific wallet's balance for a token mint (UI amount)."""
+        try:
+            result = self._rpc_call(
+                "getTokenAccountsByOwner",
+                [wallet, {"mint": mint}, {"encoding": "jsonParsed"}],
+            )
+            if not result or "value" not in result:
+                return 0.0
+            total = 0.0
+            for acct in result["value"]:
+                try:
+                    total += float(acct["account"]["data"]["parsed"]["info"]["tokenAmount"]["uiAmount"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+            return total
+        except Exception:
+            return 0.0
+
     def get_token_holders_extended(self, mint: str, *, max_wallets: int = 150) -> Dict[str, float]:
         """Get holder % for more wallets by scanning recent mint transactions.
 

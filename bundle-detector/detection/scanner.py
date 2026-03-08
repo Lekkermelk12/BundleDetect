@@ -426,6 +426,17 @@ def run_scan(
     now = int(time.time())
     clusters = _cluster_by_first_trade(list(wallet_infos.values()))
 
+    # 4b. Resolve actual token balances for clustered wallets that show 0% held.
+    #     These wallets were discovered from tx history but weren't in top 20 holders.
+    clustered_addrs = {w.address for group in clusters for w in group}
+    for addr in clustered_addrs:
+        info = wallet_infos.get(addr)
+        if info and info.pct_held < 0.001 and total_supply > 0:
+            balance = helius_client.get_token_balance(addr, contract_address)
+            if balance > 0:
+                info.pct_held = (balance / total_supply) * 100.0
+                info.still_holding = True
+
     # 5. Build RiskCluster objects
     risk_clusters: List[RiskCluster] = []
     for idx, cluster_wallets in enumerate(clusters, 1):
@@ -457,7 +468,19 @@ def run_scan(
         rc.risk_score = _compute_cluster_risk(rc)
         rc.risk_label = _risk_label(rc.risk_score)
 
-        risk_clusters.append(rc)
+        # Drop weak clusters: time proximity alone is not enough.
+        # Require at least one additional signal: common funding, meaningful
+        # supply concentration, or very tight timing (< 10 seconds).
+        has_funding_signal = rc.common_funding
+        has_supply_signal = rc.pct_bought >= 0.5 or rc.pct_held >= 0.5
+        has_tight_timing = (
+            rc.first_trade_span_minutes is not None
+            and rc.first_trade_span_minutes < 0.17  # ~10 seconds
+        )
+        has_volume_signal = rc.volume_sol >= 2.0
+
+        if has_funding_signal or has_supply_signal or has_tight_timing or has_volume_signal:
+            risk_clusters.append(rc)
 
     # Sort by amount held descending
     risk_clusters.sort(key=lambda c: c.pct_held, reverse=True)
@@ -494,23 +517,33 @@ def run_scan(
 # Clustering by first-trade proximity
 # ---------------------------------------------------------------------------
 
-TRADE_CLUSTER_WINDOW_SECONDS = 300  # 5 minutes
+TRADE_CLUSTER_WINDOW_SECONDS = 60  # 1 minute — tighter to avoid false positives
+TRADE_CLUSTER_WINDOW_RELAXED = 300  # 5 minutes — used when cluster has extra signals
 MAX_CLUSTER_SIZE = 20  # cap to avoid giant clusters from batch data
+
+# Minimum thresholds to consider a wallet for clustering
+MIN_VOLUME_SOL = 0.5  # ignore dust buys
+MIN_PCT_BOUGHT = 0.01  # ignore negligible supply
 
 
 def _cluster_by_first_trade(wallets: List[WalletInfo]) -> List[List[WalletInfo]]:
-    """Group wallets whose first trades on the token are within 5 minutes of each other.
+    """Group wallets whose first trades on the token are close in time.
 
-    Uses a sliding-window approach: walk sorted wallets and start a new cluster
-    whenever the gap between consecutive wallets exceeds half the window, or
-    when the total span from the first wallet in the group exceeds the window.
-    Clusters are capped at MAX_CLUSTER_SIZE to avoid giant noisy groups.
+    Only considers wallets above minimum volume/supply thresholds to avoid
+    flagging random retail buyers as bundlers.  Uses a tight 1-minute window
+    by default; clusters are later validated for additional signals.
     """
-    timed = [(w, w.first_trade_ts) for w in wallets if w.first_trade_ts is not None]
+    # Filter out dust/retail wallets — they are not bundlers
+    eligible = [
+        w for w in wallets
+        if w.first_trade_ts is not None
+        and (w.volume_sol >= MIN_VOLUME_SOL or w.pct_bought >= MIN_PCT_BOUGHT)
+    ]
 
-    if len(timed) < 2:
+    if len(eligible) < 2:
         return []
 
+    timed = [(w, w.first_trade_ts) for w in eligible]
     timed.sort(key=lambda t: t[1])  # type: ignore[arg-type]
 
     clusters: List[List[WalletInfo]] = []
