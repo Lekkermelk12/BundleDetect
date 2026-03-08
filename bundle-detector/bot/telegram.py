@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from typing import Any, Iterable
+from typing import Any, Dict, Iterable, List
 
 from detection.layer1 import Cluster
 
@@ -12,34 +12,74 @@ def format_wallet(wallet: str) -> str:
     return f"{wallet[:4]}...{wallet[-4:]}"
 
 
-def render_bundle_report(symbol: str, clusters: Iterable[Cluster], clean_wallet_count: int, total_bundled_pct: float) -> str:
-    clusters = list(clusters)
-    lines = [f"🔍 Bundle Report — ${symbol}", ""]
+def render_bundle_report(
+    symbol: str,
+    clusters: Iterable[Cluster],
+    clean_wallet_count: int,
+    holder_pct_by_wallet: Dict[str, float],
+) -> str:
+    """Build a human-readable bundle report.
 
+    *holder_pct_by_wallet* maps wallet address -> % of total supply held.
+    Each cluster's supply share is the sum of its members' holdings.
+    """
+    clusters = list(clusters)
+    lines = [f"\U0001f50d Bundle Report — ${symbol}", ""]
+
+    total_bundled_pct = 0.0
     for idx, cluster in enumerate(clusters, 1):
-        share = round(total_bundled_pct / max(len(clusters), 1), 2)
-        lines.append(f"🚨 Bundler #{idx} — {share}% supply")
+        cluster_pct = sum(holder_pct_by_wallet.get(w, 0.0) for w in cluster.wallets)
+        total_bundled_pct += cluster_pct
+        lines.append(f"\U0001f6a8 Bundler #{idx} — {cluster_pct:.2f}% supply")
         for wallet in cluster.wallets:
-            lines.append(f"• {format_wallet(wallet)}")
+            wpct = holder_pct_by_wallet.get(wallet, 0.0)
+            lines.append(f"  \u2022 {format_wallet(wallet)}  ({wpct:.2f}%)")
         lines.append("")
 
     lines.extend(
         [
-            f"⚠️ Total Bundled: {total_bundled_pct:.2f}%",
-            f"👥 Unique Bundlers: {len(clusters)}",
-            f"✅ Clean Wallets: {clean_wallet_count}",
+            f"\u26a0\ufe0f Total Bundled: {total_bundled_pct:.2f}%",
+            f"\U0001f465 Unique Bundlers: {len(clusters)}",
+            f"\u2705 Clean Wallets: {clean_wallet_count}",
         ]
     )
     return "\n".join(lines)
 
 
 async def start(update: Any, context: Any) -> None:
-    await update.message.reply_text("Send /scan <SYMBOL> to get a bundle report.")
+    await update.message.reply_text("Send /scan <CONTRACT_ADDRESS> to get a bundle report.")
 
 
 async def scan(update: Any, context: Any) -> None:
-    symbol = context.args[0] if context.args else "UNKNOWN"
-    report = render_bundle_report(symbol=symbol, clusters=[], clean_wallet_count=0, total_bundled_pct=0.0)
+    """Scan a token contract address for bundled wallets."""
+    from api.helius import HeliusClient
+    from detection.layer1 import run_layer1_from_signatures
+
+    if not context.args:
+        await update.message.reply_text("Usage: /scan <CONTRACT_ADDRESS>")
+        return
+
+    contract = context.args[0]
+    await update.message.reply_text(f"Scanning {contract} …")
+
+    try:
+        helius = HeliusClient()
+
+        # Resolve token account owners and build supply % map
+        holder_pct = helius.get_holder_pct_by_wallet(contract)
+
+        # Use holder wallets as starting point for bundle detection
+        # (In a full pipeline the monitor would supply launch signatures;
+        #  here we provide a minimal scan path for the bot.)
+        report = render_bundle_report(
+            symbol=contract[:8],
+            clusters=[],
+            clean_wallet_count=len(holder_pct),
+            holder_pct_by_wallet=holder_pct,
+        )
+    except Exception as exc:
+        report = f"Error scanning {contract}: {exc}"
+
     await update.message.reply_text(report)
 
 

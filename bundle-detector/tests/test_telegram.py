@@ -11,9 +11,10 @@ def test_report_format():
         fee_account="fee",
         jito_tip_lamports=5,
     )
-    text = render_bundle_report("HELIX", [cluster], clean_wallet_count=76, total_bundled_pct=24.26)
+    holder_pct = {"7xKj12343mPq": 12.13, "9pLm12348vRt": 12.13}
+    text = render_bundle_report("HELIX", [cluster], clean_wallet_count=76, holder_pct_by_wallet=holder_pct)
 
-    assert "🔍 Bundle Report — $HELIX" in text
-    assert "⚠️ Total Bundled: 24.26%" in text
-    assert "👥 Unique Bundlers: 1" in text
-    assert "✅ Clean Wallets: 76" in text
+    assert "\U0001f50d Bundle Report — $HELIX" in text
+    assert "\u26a0\ufe0f Total Bundled: 24.26%" in text
+    assert "\U0001f465 Unique Bundlers: 1" in text
+    assert "\u2705 Clean Wallets: 76" in text

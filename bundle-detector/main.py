@@ -2,9 +2,17 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from pathlib import Path
 
-from bot.telegram import run as run_bot
-from indexer.monitor import run_forever as run_monitor
+from dotenv import load_dotenv
+
+# Load .env from the bundle-detector directory (where main.py lives),
+# regardless of the working directory the process was started from.
+_HERE = Path(__file__).resolve().parent
+load_dotenv(_HERE / ".env")
+
+from bot.telegram import run as run_bot  # noqa: E402
+from indexer.monitor import run_forever as run_monitor  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:

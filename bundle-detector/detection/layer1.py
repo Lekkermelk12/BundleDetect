@@ -105,19 +105,37 @@ def extract_wallet_signal(
     )
 
 
+class _UnionFind:
+    """Simple union-find to merge clusters that share wallets."""
+
+    def __init__(self) -> None:
+        self.parent: Dict[int, int] = {}
+
+    def find(self, x: int) -> int:
+        while self.parent.get(x, x) != x:
+            self.parent[x] = self.parent.get(self.parent[x], self.parent[x])
+            x = self.parent[x]
+        return x
+
+    def union(self, a: int, b: int) -> None:
+        ra, rb = self.find(a), self.find(b)
+        if ra != rb:
+            self.parent[rb] = ra
+
+
 def detect_binary_bundles(signals: Sequence[WalletSignal]) -> List[Cluster]:
     grouped: Dict[Tuple[str, str, int], List[WalletSignal]] = {}
     for signal in signals:
         key = (signal.platform_program_id, signal.fee_account, signal.jito_tip_lamports)
         grouped.setdefault(key, []).append(signal)
 
-    clusters: List[Cluster] = []
+    raw_clusters: List[Cluster] = []
     for (program_id, fee_account, tip), members in grouped.items():
         if len(members) < 2:
             continue
 
         sorted_members = sorted(members, key=lambda m: m.wallet)
-        clusters.append(
+        raw_clusters.append(
             Cluster(
                 wallets=tuple(m.wallet for m in sorted_members),
                 signatures=tuple(m.signature for m in sorted_members),
@@ -128,7 +146,58 @@ def detect_binary_bundles(signals: Sequence[WalletSignal]) -> List[Cluster]:
             )
         )
 
-    return clusters
+    # Merge clusters that share any wallet using union-find
+    if len(raw_clusters) <= 1:
+        return raw_clusters
+
+    uf = _UnionFind()
+    wallet_to_cluster: Dict[str, int] = {}
+    for idx, cluster in enumerate(raw_clusters):
+        for wallet in cluster.wallets:
+            if wallet in wallet_to_cluster:
+                uf.union(wallet_to_cluster[wallet], idx)
+            else:
+                wallet_to_cluster[wallet] = idx
+
+    # Group clusters by their root
+    root_to_indices: Dict[int, List[int]] = {}
+    for idx in range(len(raw_clusters)):
+        root = uf.find(idx)
+        root_to_indices.setdefault(root, []).append(idx)
+
+    merged: List[Cluster] = []
+    for indices in root_to_indices.values():
+        if len(indices) == 1:
+            merged.append(raw_clusters[indices[0]])
+        else:
+            # Merge all clusters in this group
+            all_wallets: List[str] = []
+            all_sigs: List[str] = []
+            seen_wallets: set = set()
+            seen_sigs: set = set()
+            first = raw_clusters[indices[0]]
+            for i in indices:
+                c = raw_clusters[i]
+                for w in c.wallets:
+                    if w not in seen_wallets:
+                        seen_wallets.add(w)
+                        all_wallets.append(w)
+                for s in c.signatures:
+                    if s not in seen_sigs:
+                        seen_sigs.add(s)
+                        all_sigs.append(s)
+            merged.append(
+                Cluster(
+                    wallets=tuple(sorted(all_wallets)),
+                    signatures=tuple(all_sigs),
+                    platform_program_id=first.platform_program_id,
+                    platform_name=first.platform_name,
+                    fee_account=first.fee_account,
+                    jito_tip_lamports=first.jito_tip_lamports,
+                )
+            )
+
+    return merged
 
 
 def run_layer1_from_parsed_txs(
