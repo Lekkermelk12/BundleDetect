@@ -54,7 +54,13 @@ class ScanResult:
 # Helius helpers
 # ---------------------------------------------------------------------------
 
+_history_cache: Dict[str, List[Dict[str, Any]]] = {}
+
+
 def _helius_parse_history(wallet: str, limit: int = 100) -> List[Dict[str, Any]]:
+    if wallet in _history_cache:
+        return _history_cache[wallet]
+
     history_url = os.getenv("HELIUS_PARSE_HISTORY", "")
     if not history_url:
         return []
@@ -63,9 +69,12 @@ def _helius_parse_history(wallet: str, limit: int = 100) -> List[Dict[str, Any]]
         resp = requests.get(url, params={"limit": limit}, timeout=30)
         resp.raise_for_status()
         data = resp.json()
-        return data if isinstance(data, list) else []
+        result = data if isinstance(data, list) else []
     except Exception:
-        return []
+        result = []
+
+    _history_cache[wallet] = result
+    return result
 
 
 def _get_wallet_first_tx_timestamp(wallet: str) -> Optional[int]:
@@ -117,25 +126,34 @@ def _get_first_trade_on_token(wallet: str, mint: str) -> Tuple[Optional[int], fl
 
 
 def _estimate_pct_bought(wallet: str, mint: str, total_supply: float) -> float:
-    """Estimate the total % of supply a wallet bought by looking at token transfer inflows."""
+    """Estimate the total % of supply a wallet bought by looking at net token inflows per tx.
+
+    We compute the net inflow per transaction (inflows - outflows) and only sum
+    positive nets, to avoid double-counting intermediate routing within a single swap.
+    """
     if total_supply <= 0:
         return 0.0
     txs = _helius_parse_history(wallet, limit=100)
-    total_in = 0.0
-    decimals: Optional[int] = None
+    total_bought = 0.0
 
     for tx in txs:
+        net_in = 0.0
         for tt in tx.get("tokenTransfers", []) or []:
             if not isinstance(tt, dict) or tt.get("mint") != mint:
                 continue
-            to_account = tt.get("toUserAccount", "")
-            if to_account == wallet:
-                raw_amount = float(tt.get("tokenAmount", 0) or 0)
-                total_in += raw_amount
+            amount = float(tt.get("tokenAmount", 0) or 0)
+            to_acc = tt.get("toUserAccount", "")
+            from_acc = tt.get("fromUserAccount", "")
+            if to_acc == wallet:
+                net_in += amount
+            elif from_acc == wallet:
+                net_in -= amount
+        if net_in > 0:
+            total_bought += net_in
 
-    if total_in <= 0:
+    if total_bought <= 0:
         return 0.0
-    return (total_in / total_supply) * 100.0
+    return (total_bought / total_supply) * 100.0
 
 
 # ---------------------------------------------------------------------------
@@ -254,6 +272,91 @@ def _check_common_funding(wallets: List[str]) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Batch pre-fetch from mint transaction history
+# ---------------------------------------------------------------------------
+
+def _prefetch_mint_tx_data(
+    mint: str, helius_client: Any
+) -> Dict[str, Dict[str, Any]]:
+    """Batch-fetch transaction data for a mint and extract per-wallet metrics.
+
+    Returns {wallet: {first_trade_ts, volume_sol, pct_bought}} built from
+    the mint's transaction signatures, avoiding per-wallet API calls.
+    """
+    total_supply = helius_client.get_token_supply(mint)
+    try:
+        sigs = helius_client.get_signatures_for_address(mint, limit=200)
+        parsed_txs = helius_client.get_parsed_transactions_batch(sigs) if sigs else []
+    except Exception:
+        return {}
+
+    wallet_data: Dict[str, Dict[str, Any]] = {}
+    # {wallet: {first_trade_ts, volume_sol, net_tokens_in}}
+
+    for tx in parsed_txs:
+        ts = tx.get("timestamp")
+        if isinstance(ts, (int, float)) and ts > 0:
+            ts = int(ts)
+            if ts > 10_000_000_000:
+                ts = ts // 1000
+        else:
+            ts = None
+
+        # Track per-wallet net token inflow and SOL volume for this tx
+        tx_wallet_tokens: Dict[str, float] = {}
+        tx_wallet_sol: Dict[str, float] = {}
+
+        for tt in tx.get("tokenTransfers", []) or []:
+            if not isinstance(tt, dict) or tt.get("mint") != mint:
+                continue
+            amount = float(tt.get("tokenAmount", 0) or 0)
+            to_acc = tt.get("toUserAccount", "")
+            from_acc = tt.get("fromUserAccount", "")
+            if to_acc:
+                tx_wallet_tokens[to_acc] = tx_wallet_tokens.get(to_acc, 0) + amount
+            if from_acc:
+                tx_wallet_tokens[from_acc] = tx_wallet_tokens.get(from_acc, 0) - amount
+
+        for nt in tx.get("nativeTransfers", []) or []:
+            if not isinstance(nt, dict):
+                continue
+            amount = nt.get("amount", 0)
+            if isinstance(amount, (int, float)):
+                sol = abs(amount) / 1e9
+                from_acc = nt.get("fromUserAccount", "")
+                to_acc = nt.get("toUserAccount", "")
+                # Attribute volume to wallets involved in token transfers
+                if from_acc in tx_wallet_tokens:
+                    tx_wallet_sol[from_acc] = tx_wallet_sol.get(from_acc, 0) + sol
+                if to_acc in tx_wallet_tokens:
+                    tx_wallet_sol[to_acc] = tx_wallet_sol.get(to_acc, 0) + sol
+
+        for wallet, net_tokens in tx_wallet_tokens.items():
+            if wallet not in wallet_data:
+                wallet_data[wallet] = {
+                    "first_trade_ts": ts,
+                    "volume_sol": 0.0,
+                    "net_tokens_in": 0.0,
+                }
+            wd = wallet_data[wallet]
+            if ts is not None:
+                if wd["first_trade_ts"] is None or ts < wd["first_trade_ts"]:
+                    wd["first_trade_ts"] = ts
+            wd["volume_sol"] += tx_wallet_sol.get(wallet, 0.0)
+            if net_tokens > 0:
+                wd["net_tokens_in"] += net_tokens
+
+    # Convert net_tokens_in to pct_bought
+    for wd in wallet_data.values():
+        if total_supply > 0 and wd["net_tokens_in"] > 0:
+            wd["pct_bought"] = (wd["net_tokens_in"] / total_supply) * 100.0
+        else:
+            wd["pct_bought"] = 0.0
+
+    return wallet_data
+
+
+# ---------------------------------------------------------------------------
 # Main scan
 # ---------------------------------------------------------------------------
 
@@ -264,6 +367,7 @@ def run_scan(
     token_symbol: str = "",
 ) -> ScanResult:
     """Run the full scan pipeline for a token contract."""
+    _history_cache.clear()
 
     # 1. Get holder data
     holder_pct = helius_client.get_holder_pct_by_wallet(contract_address)
@@ -281,25 +385,32 @@ def run_scan(
             high_risk_count=0,
         )
 
-    # 2. Build WalletInfo for each holder
+    # 2. Pre-fetch batch transaction data for all wallets from mint history
+    #    This avoids per-wallet API calls for first trade / volume / bought.
+    mint_tx_data = _prefetch_mint_tx_data(contract_address, helius_client)
+
+    # 3. Build WalletInfo for each holder
     wallet_infos: Dict[str, WalletInfo] = {}
     for wallet_addr, pct in holder_pct.items():
         info = WalletInfo(address=wallet_addr, pct_held=pct)
+        info.still_holding = pct > 0.001
 
-        # Get first trade on this token + volume
-        first_trade, vol_sol = _get_first_trade_on_token(wallet_addr, contract_address)
-        info.first_trade_ts = first_trade
-        info.volume_sol = vol_sol
+        pre = mint_tx_data.get(wallet_addr)
+        if pre:
+            info.first_trade_ts = pre["first_trade_ts"]
+            info.volume_sol = pre["volume_sol"]
+            info.pct_bought = pre["pct_bought"]
+            info.wallet_age_ts = pre["first_trade_ts"]  # approximate age from trade
+        else:
+            # Fallback: per-wallet API call (only for top 20 holders not in batch)
+            first_trade, vol_sol = _get_first_trade_on_token(wallet_addr, contract_address)
+            info.first_trade_ts = first_trade
+            info.volume_sol = vol_sol
+            info.wallet_age_ts = _get_wallet_first_tx_timestamp(wallet_addr)
+            info.pct_bought = _estimate_pct_bought(wallet_addr, contract_address, total_supply)
 
-        # Get wallet age
-        info.wallet_age_ts = _get_wallet_first_tx_timestamp(wallet_addr)
-
-        # Estimate bought %
-        info.pct_bought = _estimate_pct_bought(wallet_addr, contract_address, total_supply)
         if info.pct_bought < info.pct_held:
-            info.pct_bought = info.pct_held  # at minimum they bought what they hold
-
-        info.still_holding = info.pct_held > 0.001
+            info.pct_bought = info.pct_held
 
         wallet_infos[wallet_addr] = info
 
@@ -384,34 +495,45 @@ def run_scan(
 # ---------------------------------------------------------------------------
 
 TRADE_CLUSTER_WINDOW_SECONDS = 300  # 5 minutes
+MAX_CLUSTER_SIZE = 20  # cap to avoid giant clusters from batch data
 
 
 def _cluster_by_first_trade(wallets: List[WalletInfo]) -> List[List[WalletInfo]]:
-    """Group wallets whose first trades on the token are within 5 minutes of each other."""
+    """Group wallets whose first trades on the token are within 5 minutes of each other.
+
+    Uses a sliding-window approach: walk sorted wallets and start a new cluster
+    whenever the gap between consecutive wallets exceeds half the window, or
+    when the total span from the first wallet in the group exceeds the window.
+    Clusters are capped at MAX_CLUSTER_SIZE to avoid giant noisy groups.
+    """
     timed = [(w, w.first_trade_ts) for w in wallets if w.first_trade_ts is not None]
-    untimed = [w for w in wallets if w.first_trade_ts is None]
 
     if len(timed) < 2:
-        # No clustering possible — each wallet is its own group
         return []
 
     timed.sort(key=lambda t: t[1])  # type: ignore[arg-type]
 
     clusters: List[List[WalletInfo]] = []
-    i = 0
-    used = set()
-    while i < len(timed):
-        group = [timed[i][0]]
-        used.add(timed[i][0].address)
-        earliest = timed[i][1]
-        j = i + 1
-        while j < len(timed) and (timed[j][1] - earliest) <= TRADE_CLUSTER_WINDOW_SECONDS:  # type: ignore[operator]
-            group.append(timed[j][0])
-            used.add(timed[j][0].address)
-            j += 1
-        if len(group) >= 2:
-            clusters.append(group)
-        i = j
+    group: List[WalletInfo] = [timed[0][0]]
+    group_start = timed[0][1]
+
+    for k in range(1, len(timed)):
+        wallet, ts = timed[k]
+        prev_ts = timed[k - 1][1]
+        gap = ts - prev_ts  # type: ignore[operator]
+        span = ts - group_start  # type: ignore[operator]
+
+        # Start new group if gap > half window, total span > window, or size cap hit
+        if gap > TRADE_CLUSTER_WINDOW_SECONDS // 2 or span > TRADE_CLUSTER_WINDOW_SECONDS or len(group) >= MAX_CLUSTER_SIZE:
+            if len(group) >= 2:
+                clusters.append(group)
+            group = [wallet]
+            group_start = ts
+        else:
+            group.append(wallet)
+
+    if len(group) >= 2:
+        clusters.append(group)
 
     return clusters
 
